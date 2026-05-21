@@ -45,6 +45,7 @@
 #include <private/qqmlglobal_p.h>
 
 #include <private/qqmlcomponent_p.h>
+#include <private/qqmlincubator_p.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -438,9 +439,8 @@ void QQuickLoader::loadFromSource()
     }
 
     if (isComponentComplete()) {
-        QQmlComponent::CompilationMode mode = d->asynchronous ? QQmlComponent::Asynchronous : QQmlComponent::PreferSynchronous;
         if (!d->component)
-            d->component.setObject(new QQmlComponent(qmlEngine(this), d->source, mode, this), this);
+            d->createComponent();
         d->load();
     }
 }
@@ -588,8 +588,15 @@ void QQuickLoader::setSource(QQmlV4Function *args)
     if (ipvError)
         return;
 
+    // 1. If setSource is called with a valid url, clear the old component and its corresponding url
+    // 2. If setSource is called with an invalid url(e.g. empty url), clear the old component but
+    // hold the url for old one.(we will compare it with new url later and may update status of loader to Loader.Null)
+    QUrl oldUrl = d->source;
     d->clear();
     QUrl sourceUrl = d->resolveSourceUrl(args);
+    if (!sourceUrl.isValid())
+        d->source = oldUrl;
+
     d->disposeInitialPropertyValues();
     if (!ipv->isUndefined()) {
         d->initialPropertyValues.set(args->v4engine(), ipv);
@@ -665,7 +672,8 @@ void QQuickLoaderPrivate::setInitialState(QObject *obj)
     QV4::Scope scope(v4);
     QV4::ScopedValue ipv(scope, initialPropertyValues.value());
     QV4::Scoped<QV4::QmlContext> qmlContext(scope, qmlCallingContext.value());
-    d->initializeObjectWithInitialProperties(qmlContext, ipv, obj);
+    auto incubatorPriv = QQmlIncubatorPrivate::get(incubator);
+    d->initializeObjectWithInitialProperties(qmlContext, ipv, obj, incubatorPriv->requiredProperties());
 }
 
 void QQuickLoaderIncubator::statusChanged(Status status)
@@ -709,7 +717,6 @@ void QQuickLoaderPrivate::incubatorStateChanged(QQmlIncubator::Status status)
     emit q->progressChanged();
     if (status == QQmlIncubator::Ready)
         emit q->loaded();
-    disposeInitialPropertyValues(); // cleanup
 }
 
 void QQuickLoaderPrivate::_q_sourceLoaded()
@@ -728,6 +735,9 @@ void QQuickLoaderPrivate::_q_sourceLoaded()
         disposeInitialPropertyValues(); // cleanup
         return;
     }
+
+    if (!active)
+        return;
 
     QQmlContext *creationContext = component->creationContext();
     if (!creationContext) creationContext = qmlContext(q);
@@ -795,11 +805,8 @@ void QQuickLoader::componentComplete()
     Q_D(QQuickLoader);
     QQuickItem::componentComplete();
     if (active()) {
-        if (d->loadingFromSource) {
-            QQmlComponent::CompilationMode mode = d->asynchronous ? QQmlComponent::Asynchronous : QQmlComponent::PreferSynchronous;
-            if (!d->component)
-                d->component.setObject(new QQmlComponent(qmlEngine(this), d->source, mode, this), this);
-        }
+        if (d->loadingFromSource && !d->component)
+            d->createComponent();
         d->load();
     }
 }
@@ -821,8 +828,6 @@ void QQuickLoader::itemChange(QQuickItem::ItemChange change, const QQuickItem::I
 
     This signal is emitted when the \l status becomes \c Loader.Ready, or on successful
     initial load.
-
-    The corresponding handler is \c onLoaded.
 */
 
 
@@ -937,7 +942,7 @@ void QQuickLoaderPrivate::_q_updateSize(bool loaderGeometryChanged)
 }
 
 /*!
-    \qmlproperty object QtQuick::Loader::item
+    \qmlproperty QtObject QtQuick::Loader::item
     This property holds the top-level object that is currently loaded.
 
     Since \c {QtQuick 2.0}, Loader can load any object type.
@@ -961,6 +966,8 @@ QUrl QQuickLoaderPrivate::resolveSourceUrl(QQmlV4Function *args)
 {
     QV4::Scope scope(args->v4engine());
     QV4::ScopedValue v(scope, (*args)[0]);
+    if (v->isUndefined())
+        return QUrl();
     QString arg = v->toQString();
     if (arg.isEmpty())
         return QUrl();
@@ -1031,6 +1038,22 @@ void QQuickLoaderPrivate::updateStatus()
         status = newStatus;
         emit q->statusChanged();
     }
+}
+
+void QQuickLoaderPrivate::createComponent()
+{
+    Q_Q(QQuickLoader);
+    const QQmlComponent::CompilationMode mode = asynchronous
+            ? QQmlComponent::Asynchronous
+            : QQmlComponent::PreferSynchronous;
+    if (QQmlContext *context = qmlContext(q)) {
+        if (QQmlEngine *engine = context->engine()) {
+            component.setObject(new QQmlComponent(engine, source, mode, q), q);
+            return;
+        }
+    }
+
+    qmlWarning(q) << "createComponent: Cannot find a QML engine.";
 }
 
 #include <moc_qquickloader_p.cpp>
